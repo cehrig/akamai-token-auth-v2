@@ -5,11 +5,13 @@ use std::{
     collections::BTreeSet,
     fmt::Display,
     hash::Hash,
+    net::IpAddr,
     ops::{Deref, DerefMut},
     time::Duration,
 };
 
 const DEFAULT_DELIMITER: &str = "~";
+const ACL_DELIMITER: &str = "!";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -36,9 +38,15 @@ pub struct WithStartAndEnd<S, E> {
 }
 
 #[derive(Debug)]
+pub struct WithUrl<S, E> {
+    time: WithStartAndEnd<S, E>,
+    attrs: TokenAttributeSet,
+}
+
+#[derive(Debug)]
 pub struct WithKey<S, E> {
     time: WithStartAndEnd<S, E>,
-    key: String,
+    key: KeyType,
     attrs: TokenAttributeSet,
     delimiter: &'static str,
 }
@@ -48,12 +56,22 @@ pub enum Attribute {
     Start(chrono::DateTime<Utc>),
     End(chrono::DateTime<Utc>),
     Url(String),
+    Acl(Vec<String>),
+    Ip(IpAddr),
+    SessionId(String),
+    Payload(String),
     Hmac(String),
 }
 
 pub enum TimeValue {
     Fixed(chrono::DateTime<Utc>),
     Relative(chrono::Duration),
+}
+
+#[derive(Debug)]
+enum KeyType {
+    Hex(String),
+    Raw(Vec<u8>),
 }
 
 impl TokenAttributeSet {
@@ -110,12 +128,81 @@ impl TokenBuilder<()> {
 }
 
 impl<S, E> TokenBuilder<WithStartAndEnd<S, E>> {
-    pub fn with_key(self, key: impl ToString) -> TokenBuilder<WithKey<S, E>> {
+    pub fn with_url(self, url: impl ToString) -> TokenBuilder<WithUrl<S, E>> {
+        let mut attrs = TokenAttributeSet::default();
+        attrs.insert(Attribute::url(url.to_string()));
+
+        TokenBuilder {
+            state: WithUrl {
+                time: self.state,
+                attrs,
+            },
+        }
+    }
+
+    pub fn with_acl<I, A>(self, acl: I) -> TokenBuilder<WithUrl<S, E>>
+    where
+        I: IntoIterator<Item = A>,
+        A: ToString,
+    {
+        let mut attrs = TokenAttributeSet::default();
+        attrs.insert(Attribute::acl(
+            acl.into_iter().map(|a| a.to_string()).collect(),
+        ));
+
+        self.next(attrs)
+    }
+
+    fn next(self, attrs: TokenAttributeSet) -> TokenBuilder<WithUrl<S, E>> {
+        TokenBuilder {
+            state: WithUrl {
+                time: self.state,
+                attrs,
+            },
+        }
+    }
+}
+
+impl<S, E> TokenBuilder<WithUrl<S, E>> {
+    pub fn with_ip(mut self, ip: IpAddr) -> Self {
+        let ip = Attribute::ip(ip);
+
+        self.state.attrs.insert(ip);
+        self
+    }
+
+    pub fn with_session_id(mut self, id: impl ToString) -> Self {
+        let session_id = Attribute::session_id(id.to_string());
+
+        self.state.attrs.insert(session_id);
+        self
+    }
+
+    pub fn with_payload(mut self, payload: impl ToString) -> Self {
+        let payload = Attribute::payload(payload.to_string());
+
+        self.state.attrs.insert(payload);
+        self
+    }
+
+    pub fn with_hex(self, key: impl ToString) -> TokenBuilder<WithKey<S, E>> {
+        let key = KeyType::Hex(key.to_string());
+
+        self.next(key)
+    }
+
+    pub fn with_raw(self, key: impl AsRef<[u8]>) -> TokenBuilder<WithKey<S, E>> {
+        let key = KeyType::Raw(key.as_ref().to_vec());
+
+        self.next(key)
+    }
+
+    fn next(self, key: KeyType) -> TokenBuilder<WithKey<S, E>> {
         TokenBuilder {
             state: WithKey {
-                time: self.state,
-                key: key.to_string(),
-                attrs: Default::default(),
+                time: self.state.time,
+                key,
+                attrs: self.state.attrs,
                 delimiter: DEFAULT_DELIMITER,
             },
         }
@@ -146,7 +233,12 @@ where
             .collect::<Vec<_>>()
             .join(self.state.delimiter);
 
-        let key = hex::decode(self.state.key).unwrap();
+        let key = match self.state.key {
+            KeyType::Hex(hex) => {
+                hex::decode(hex).map_err(|_| "unable to decode hex key")?
+            }
+            KeyType::Raw(raw) => raw,
+        };
 
         let mut mac = HmacSha256::new_from_slice(&key)
             .map_err(|_| "HMAC can take key of any size")?;
@@ -172,10 +264,6 @@ where
 }
 
 impl Attribute {
-    fn for_token(&self) -> bool {
-        !matches!(self, Attribute::Url(_))
-    }
-
     fn start(time: chrono::DateTime<Utc>) -> Self {
         Self::Start(time)
     }
@@ -188,8 +276,28 @@ impl Attribute {
         Self::Hmac(hmac)
     }
 
-    pub fn url(url: impl ToString) -> Self {
-        Self::Url(escape(&url.to_string()))
+    fn url(url: String) -> Self {
+        Self::Url(url)
+    }
+
+    fn acl(acl: Vec<String>) -> Self {
+        Self::Acl(acl)
+    }
+
+    fn ip(ip: IpAddr) -> Self {
+        Self::Ip(ip)
+    }
+
+    fn session_id(id: String) -> Self {
+        Self::SessionId(id)
+    }
+
+    fn payload(payload: String) -> Self {
+        Self::Payload(payload)
+    }
+
+    fn for_token(&self) -> bool {
+        !matches!(self, Attribute::Url(_))
     }
 }
 
@@ -204,8 +312,21 @@ impl Display for Attribute {
                 }
                 Attribute::End(date_time) =>
                     format!("exp={}", date_time.timestamp()),
-                Attribute::Url(url) => format!("url={}", url),
+                Attribute::Url(url) => format!("url={}", escape(url)),
                 Attribute::Hmac(hmac) => format!("hmac={}", hmac),
+                Attribute::Acl(items) => format!(
+                    "acl={}",
+                    items
+                        .iter()
+                        .map(String::as_str)
+                        .map(escape)
+                        .collect::<Vec<_>>()
+                        .join(ACL_DELIMITER)
+                ),
+                Attribute::Ip(ip) => format!("ip={}", escape(&ip.to_string())),
+                Attribute::SessionId(session_id) =>
+                    format!("id={}", escape(session_id)),
+                Attribute::Payload(payload) => format!("data={}", escape(payload)),
             }
         )
     }
@@ -265,6 +386,25 @@ impl TryFrom<chrono::DateTime<Utc>> for TimeValue {
 
     fn try_from(value: chrono::DateTime<Utc>) -> Result<Self, Self::Error> {
         Ok(TimeValue::Fixed(value))
+    }
+}
+
+impl<S> TryFrom<Option<S>> for TimeValue
+where
+    S: TryInto<TimeValue, Error = &'static str>,
+{
+    type Error = &'static str;
+
+    fn try_from(value: Option<S>) -> Result<Self, Self::Error> {
+        value.map_or_else(|| Ok(TimeValue::Fixed(Utc::now())), TryInto::try_into)
+    }
+}
+
+impl TryFrom<()> for TimeValue {
+    type Error = &'static str;
+
+    fn try_from(_: ()) -> Result<Self, Self::Error> {
+        Ok(TimeValue::Fixed(Utc::now()))
     }
 }
 
